@@ -149,9 +149,11 @@ export async function parseMenu(images: MenuImage[]): Promise<ParseMenuResult> {
   const client = new Anthropic({ apiKey });
 
   const response = await client.messages.create({
-    // User explicitly accepted Sonnet 4.6 as the parser default in setup.
-    model: "claude-sonnet-4-6",
-    max_tokens: 8000,
+    // Haiku 4.5 for vision OCR — ~2-3× faster than Sonnet, fits Vercel's
+    // 60s function cap. Switch back to claude-sonnet-4-6 if OCR quality
+    // suffers on complex/handwritten menus.
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 4000,
     system: [
       {
         type: "text",
