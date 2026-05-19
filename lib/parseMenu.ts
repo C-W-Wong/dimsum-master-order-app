@@ -17,7 +17,7 @@ export type MenuImage = {
  */
 const SYSTEM_PROMPT = `You are a restaurant-menu OCR and extraction expert.
 
-You will receive one or more photos of a restaurant menu — often Chinese + English, often handwritten codes (A1, B7, F12), often with category-level pricing ("Dim Sum A — all items $5.68"). Your job is to extract the FULL menu and call the submit_menu tool with structured data.
+You will receive one or more photos of a restaurant menu. Menus may be in any language (commonly Chinese + English, but also Japanese, Korean, Thai, etc.), printed or handwritten, with or without item codes (A1, B7, M12), and sometimes with category-level pricing ("Appetizers — all items $5.68"). Your job is to extract the FULL menu and call the submit_menu tool with structured data.
 
 # Output contract
 
@@ -29,7 +29,7 @@ Call submit_menu exactly once with the complete menu. Do not write any other tex
 - restaurant.en — restaurant name in English. Translate if menu only shows Chinese.
 - currency — ISO 4217 code: "USD" (default for US menus), "HKD" (Hong Kong), "TWD" (Taiwan), "CNY", "CAD", "EUR", "JPY", "GBP", etc.
 - categories — every printed section of the menu, in the order they appear.
-- items — every visible dish. Be exhaustive: a typical dim sum sheet has 40-80 items.
+- items — every visible dish. Be exhaustive.
 
 # Field rules
 

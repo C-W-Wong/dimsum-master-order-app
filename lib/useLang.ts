@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import type { Lang } from "./i18n";
 
-const KEY = "dimsum:lang";
+const KEY = "gmo:lang";
 
 function detect(): Lang {
   if (typeof navigator === "undefined") return "zh";

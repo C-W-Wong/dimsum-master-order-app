@@ -2,11 +2,7 @@ export type Lang = "zh" | "en";
 
 const dict = {
   // App-wide
-  appName: { zh: "點心王子 · 揪團點餐", en: "Dim Sum King · Group Order" },
-  tagline: {
-    zh: "和朋友一起點餐，互看清單，免重複。",
-    en: "Order dim sum together — see what's already in the basket.",
-  },
+  appName: { zh: "揪團點餐", en: "Group Menu Order" },
 
   // Home
   yourName: { zh: "你的稱呼", en: "Your name" },

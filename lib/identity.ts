@@ -1,7 +1,7 @@
 "use client";
 
-const NAME_KEY = "dimsum:name";
-const USER_PREFIX = "dimsum:user:"; // per-room user id, since the API issues a fresh one on join
+const NAME_KEY = "gmo:name";
+const USER_PREFIX = "gmo:user:"; // per-room user id, since the API issues a fresh one on join
 
 export function readName(): string {
   if (typeof window === "undefined") return "";
