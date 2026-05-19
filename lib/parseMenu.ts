@@ -201,19 +201,15 @@ async function ocrImage(
   return { text, usage: response.usage };
 }
 
-async function structureMenu(
+async function tryStructure(
   client: Anthropic,
-  ocrTexts: string[]
-): Promise<{ menu: ParsedMenu; usage: Anthropic.Messages.Usage }> {
-  const userText =
-    ocrTexts.length === 1
-      ? `OCR'd menu text:\n\n${ocrTexts[0]}`
-      : `OCR'd text from ${ocrTexts.length} menu photos. Merge them into one menu.\n\n` +
-        ocrTexts.map((t, i) => `--- PHOTO ${i + 1} ---\n${t}`).join("\n\n");
-
+  model: string,
+  userText: string,
+  maxTokens: number
+): Promise<{ menu: ParsedMenu | null; usage: Anthropic.Messages.Usage }> {
   const response = await client.messages.create({
-    model: "claude-haiku-4-5-20251001",
-    max_tokens: 3000,
+    model,
+    max_tokens: maxTokens,
     temperature: 0,
     system: [
       {
@@ -230,12 +226,62 @@ async function structureMenu(
   const toolUse = response.content.find(
     (block) => block.type === "tool_use" && block.name === "submit_menu"
   );
-  if (!toolUse || toolUse.type !== "tool_use") {
+  return {
+    menu: toolUse && toolUse.type === "tool_use" ? (toolUse.input as ParsedMenu) : null,
+    usage: response.usage,
+  };
+}
+
+async function structureMenu(
+  client: Anthropic,
+  ocrTexts: string[]
+): Promise<{ menu: ParsedMenu; usage: Anthropic.Messages.Usage[] }> {
+  const userText =
+    ocrTexts.length === 1
+      ? `OCR'd menu text:\n\n${ocrTexts[0]}`
+      : `OCR'd text from ${ocrTexts.length} menu photos. Merge them into one menu.\n\n` +
+        ocrTexts.map((t, i) => `--- PHOTO ${i + 1} ---\n${t}`).join("\n\n");
+
+  // First try: Haiku 4.5 (fast). Usually sufficient for clean menus.
+  const t0 = Date.now();
+  const haiku = await tryStructure(
+    client,
+    "claude-haiku-4-5-20251001",
+    userText,
+    3000
+  );
+  const haikuItems = haiku.menu?.items?.length ?? 0;
+  console.log(
+    `[parseMenu] structure (haiku) ${Date.now() - t0}ms → ${haikuItems} items`
+  );
+
+  if (haiku.menu && haikuItems > 0) {
+    return { menu: haiku.menu, usage: [haiku.usage] };
+  }
+
+  // Fallback: Sonnet 4.6. Haiku sometimes gives up on dense/handwritten menus
+  // even when the OCR text is fine. Sonnet is more thorough.
+  const t1 = Date.now();
+  console.log(
+    `[parseMenu] structure (haiku) returned ${haikuItems} items — retrying with sonnet`
+  );
+  const sonnet = await tryStructure(
+    client,
+    "claude-sonnet-4-6",
+    userText,
+    4000
+  );
+  const sonnetItems = sonnet.menu?.items?.length ?? 0;
+  console.log(
+    `[parseMenu] structure (sonnet fallback) ${Date.now() - t1}ms → ${sonnetItems} items`
+  );
+
+  if (!sonnet.menu || sonnetItems === 0) {
     throw new Error(
-      "Claude did not call submit_menu — OCR text may be unreadable"
+      "Couldn't extract any dishes from the OCR text — try re-shooting with better lighting or closer crop."
     );
   }
-  return { menu: toolUse.input as ParsedMenu, usage: response.usage };
+  return { menu: sonnet.menu, usage: [haiku.usage, sonnet.usage] };
 }
 
 export async function parseMenu(images: MenuImage[]): Promise<ParseMenuResult> {
@@ -312,23 +358,22 @@ export async function parseMenu(images: MenuImage[]): Promise<ParseMenuResult> {
     `[parseMenu] total: ${Date.now() - t0}ms (final: ${menu.items.length} items, ${menu.categories.length} categories)`
   );
 
-  // Aggregate usage across all calls.
-  const totalUsage = okOcr.reduce(
-    (acc, r) => ({
-      input_tokens: acc.input_tokens + r.usage.input_tokens,
-      output_tokens: acc.output_tokens + r.usage.output_tokens,
+  // Aggregate usage across all OCR + structure calls.
+  const allUsages = [...okOcr.map((r) => r.usage), ...structureUsage];
+  const totalUsage = allUsages.reduce(
+    (acc, u) => ({
+      input_tokens: acc.input_tokens + u.input_tokens,
+      output_tokens: acc.output_tokens + u.output_tokens,
       cache_read_input_tokens:
-        acc.cache_read_input_tokens + (r.usage.cache_read_input_tokens ?? 0),
+        acc.cache_read_input_tokens + (u.cache_read_input_tokens ?? 0),
       cache_creation_input_tokens:
-        acc.cache_creation_input_tokens +
-        (r.usage.cache_creation_input_tokens ?? 0),
+        acc.cache_creation_input_tokens + (u.cache_creation_input_tokens ?? 0),
     }),
     {
-      input_tokens: structureUsage.input_tokens,
-      output_tokens: structureUsage.output_tokens,
-      cache_read_input_tokens: structureUsage.cache_read_input_tokens ?? 0,
-      cache_creation_input_tokens:
-        structureUsage.cache_creation_input_tokens ?? 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read_input_tokens: 0,
+      cache_creation_input_tokens: 0,
     }
   );
 
