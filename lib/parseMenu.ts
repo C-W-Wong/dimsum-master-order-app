@@ -159,7 +159,7 @@ async function ocrImage(
 ): Promise<{ text: string; usage: Anthropic.Messages.Usage }> {
   const response = await client.messages.create({
     model: "claude-haiku-4-5-20251001",
-    max_tokens: 3000,
+    max_tokens: 2500,
     temperature: 0,
     system: [
       {
@@ -211,9 +211,12 @@ async function structureMenu(
       : `OCR'd text from ${ocrTexts.length} menu photos. Merge them into one menu.\n\n` +
         ocrTexts.map((t, i) => `--- PHOTO ${i + 1} ---\n${t}`).join("\n\n");
 
+  // Haiku 4.5 for structuring: now that text is already extracted, the task is
+  // text → JSON via tool use, which Haiku handles well and ~3× faster than Sonnet.
+  // Sonnet structuring was eating ~45s of the 60s budget.
   const response = await client.messages.create({
-    model: "claude-sonnet-4-6",
-    max_tokens: 4000,
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 3000,
     temperature: 0,
     system: [
       {
