@@ -250,14 +250,31 @@ export async function parseMenu(images: MenuImage[]): Promise<ParseMenuResult> {
 
   const client = new Anthropic({ apiKey });
 
+  const t0 = Date.now();
+  console.log(`[parseMenu] start: ${images.length} image(s)`);
+
   // Stage 1: parallel OCR.
   const ocrResults = await Promise.all(
-    images.map((img) => ocrImage(client, img))
+    images.map(async (img, i) => {
+      const start = Date.now();
+      const result = await ocrImage(client, img);
+      console.log(
+        `[parseMenu] OCR ${i + 1}/${images.length} done in ${
+          Date.now() - start
+        }ms (${result.text.length} chars)`
+      );
+      return result;
+    })
   );
   const ocrTexts = ocrResults.map((r) => r.text);
+  console.log(`[parseMenu] stage 1 (OCR) total: ${Date.now() - t0}ms`);
 
   // Stage 2: text-only structuring.
+  const t1 = Date.now();
   const { menu, usage: structureUsage } = await structureMenu(client, ocrTexts);
+  console.log(`[parseMenu] stage 2 (structure) done in ${Date.now() - t1}ms`);
+  console.log(`[parseMenu] total: ${Date.now() - t0}ms`);
+
   validateMenu(menu);
 
   // Aggregate usage across all calls so the caller sees the true cost.
