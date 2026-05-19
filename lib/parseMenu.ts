@@ -13,18 +13,15 @@ export type MenuImage = {
 /**
  * Pipeline:
  *   1. Each image → Haiku 4.5 vision OCR (parallel). Output is plain text.
- *   2. Combined OCR text → Sonnet 4.6 text-only structuring via submit_menu tool.
+ *   2. Combined OCR text → Haiku 4.5 text-only structuring via submit_menu tool.
  *
- * Two-stage is dramatically faster than a single Sonnet vision call because:
- *   - Haiku is ~3× faster than Sonnet, and OCR (no reasoning) suits it.
- *   - Sonnet on text-only is ~3× faster than Sonnet on vision.
- *   - OCR for N photos runs in parallel; total wall-clock = max(OCR) + structure.
- *
- * Both system prompts use cache_control: ephemeral so the static prefixes hit
- * Anthropic's 5-min prompt cache after the first call.
+ * Fault tolerance:
+ *   - Per-image OCR failures don't fail the parse; we use whatever succeeded.
+ *   - Structuring auto-repairs common issues (dedup ids, drop orphan items)
+ *     instead of throwing, so a near-miss menu still surfaces to the user.
  */
 
-const OCR_SYSTEM_PROMPT = `You are an OCR engine for restaurant menus. Your only job is to transcribe text from the photo verbatim.
+const OCR_SYSTEM_PROMPT = `You are an OCR engine for restaurant menus. Your ONLY job is to transcribe text from the photo verbatim.
 
 Rules:
 - Transcribe EVERY visible character: dish names (any language), prices, item codes (A1, B7, F12), category headers, notes, units (件, pcs, lb, oz, 隻, 半隻), currency symbols, taglines.
@@ -32,44 +29,47 @@ Rules:
 - Keep Chinese characters as Chinese; Japanese as Japanese; etc. Do NOT translate.
 - For each row, keep name and price on the same line. Separate with two spaces.
 - Use a blank line between menu sections.
-- If a value is unclear, transcribe your best guess — don't omit the row.
+- If a character is unclear, transcribe your best guess — NEVER omit a row.
+- Do NOT refuse. Do NOT return an empty response. Even partial transcription is valuable.
 - Do NOT interpret, structure, JSON-ify, summarize, or comment. Output transcription only.`;
 
 const STRUCTURE_SYSTEM_PROMPT = `You are a restaurant-menu structuring expert.
 
-You will receive OCR-transcribed text from one or more menu photos. The OCR is faithful to the photo but may have garbled characters, broken layout, duplicate fragments, or items split across lines. Your job is to clean it up and call the submit_menu tool with structured data.
+You receive OCR-transcribed text from one or more menu photos. The OCR is faithful but may have garbled characters, broken layout, duplicate fragments, or items split across lines. Your job: clean it up and call submit_menu with structured data.
 
-# Output contract
+# CRITICAL RULES — do not violate these
 
-Call submit_menu exactly once with the complete menu. Do not write any other text.
+1. Call submit_menu EXACTLY ONCE. Do not write any other text.
+2. items MUST contain at least one dish if there is any food-like text in the OCR. An empty items array is ALWAYS wrong — extract everything you can.
+3. categories MUST contain at least one entry. If the OCR has no obvious section headers, create a single category called "menu" / "菜單".
+4. Every item.category MUST exactly match a categories[].id you created. Double-check before emitting.
+5. IDs are lower-snake-case slugs, UNIQUE within the menu. If two dishes have the same English name, suffix with -2, -3 etc.
 
 # Required fields
 
-- restaurant.zh — restaurant name in Traditional Chinese. Translate if menu only shows English.
-- restaurant.en — restaurant name in English. Translate if menu only shows Chinese.
-- currency — ISO 4217 code: "USD" (default for US menus), "HKD" (Hong Kong), "TWD" (Taiwan), "CNY", "CAD", "EUR", "JPY", "GBP", etc.
+- restaurant.zh — restaurant name in Traditional Chinese (translate if menu shows English only; if no name visible, use "餐廳").
+- restaurant.en — restaurant name in English (translate if menu shows Chinese only; if no name visible, use "Restaurant").
+- currency — ISO 4217 code: "USD" (default for US menus), "HKD", "TWD", "CNY", "CAD", "EUR", "JPY", "GBP".
 - categories — every section visible in the OCR, in the order they appear.
 - items — every visible dish. Be exhaustive.
 
 # Field rules
 
-- IDs are short slugs in lower-snake-case, unique within the menu. Prefer the menu code lowercased when one exists ("a1", "b7", "f12"), otherwise derive from the English name ("shrimp-har-gow"). Never reuse an id.
-- Every item.category must EXACTLY match one categories[].id you produced. Validate before emitting.
-- zh: prefer Traditional Chinese (繁體) unless the menu is clearly Simplified. Translate faithfully when only English is shown.
-- en: natural, idiomatic English. Translate faithfully when only Chinese is shown.
-- code: only set when a menu number is printed next to the item ("A1", "B7", "C12", "F19"). Omit otherwise.
-- price: numeric, in the menu's currency. Omit if the category's flatPrice applies. Strip currency symbols (the currency is stored separately).
-- flatPrice on a category: set when the menu says "all items in this section are $X". Items in that category should usually omit their own price.
-- unitZh / unitEn: short qualifier shown on the menu — "4 件" / "4 pcs", "半隻" / "Half", "每磅" / "per lb". Omit when not present.
-- noteZh / noteEn: optional category caption — "全日供應" / "All day", "等候約 10 分鐘" / "≈ 10 min wait".
+- code: only set when a menu number is printed next to the item (A1, B7, C12, F19). Omit otherwise.
+- price: numeric, in the menu's currency. Omit if category has flatPrice. Strip currency symbols.
+- flatPrice on a category: set when the menu says "all items in this section are $X".
+- unitZh / unitEn: short qualifier — "4 件" / "4 pcs", "半隻" / "Half", "每磅" / "per lb". Omit when not present.
+- noteZh / noteEn: optional category caption — "全日供應" / "All day".
+- zh: prefer Traditional Chinese (繁體). Translate when only English is shown.
+- en: natural, idiomatic English. Translate when only Chinese is shown.
 
 # Handling OCR noise
 
-- If multiple photos are stitched together (separated by "--- PHOTO N ---"), merge them into one menu and do NOT duplicate items that appear on multiple photos.
-- If fragments look like a single dish broken across lines, merge them.
-- Skip OCR junk: hours, phone numbers (unless restaurant.phone), legal disclaimers, photography credits, "prices subject to change", marketing taglines.
+- If multiple photos are stitched together (marked "--- PHOTO N ---"), merge into one menu; do NOT duplicate items.
+- If fragments look like one dish broken across lines, merge them.
+- Skip junk: hours, phone numbers, legal disclaimers, photo credits, "prices subject to change", marketing taglines.
 
-Be exhaustive, precise, and consistent. If a value is ambiguous, prefer leaving the optional field out over guessing.`;
+Remember: it is FAR better to emit a partial menu with best-effort translations than to fail with an empty items array.`;
 
 const SUBMIT_MENU_TOOL: Anthropic.Tool = {
   name: "submit_menu",
@@ -182,7 +182,7 @@ async function ocrImage(
           },
           {
             type: "text",
-            text: "Transcribe all visible text from this menu photo. Plain text only, preserving order.",
+            text: "Transcribe all visible text from this menu photo. Plain text only, preserving order. Do not refuse, do not summarize.",
           },
         ],
       },
@@ -196,7 +196,7 @@ async function ocrImage(
     .trim();
 
   if (!text) {
-    throw new Error("OCR returned empty text — try a clearer photo");
+    throw new Error("OCR returned empty text");
   }
   return { text, usage: response.usage };
 }
@@ -211,9 +211,6 @@ async function structureMenu(
       : `OCR'd text from ${ocrTexts.length} menu photos. Merge them into one menu.\n\n` +
         ocrTexts.map((t, i) => `--- PHOTO ${i + 1} ---\n${t}`).join("\n\n");
 
-  // Haiku 4.5 for structuring: now that text is already extracted, the task is
-  // text → JSON via tool use, which Haiku handles well and ~3× faster than Sonnet.
-  // Sonnet structuring was eating ~45s of the 60s budget.
   const response = await client.messages.create({
     model: "claude-haiku-4-5-20251001",
     max_tokens: 3000,
@@ -256,32 +253,67 @@ export async function parseMenu(images: MenuImage[]): Promise<ParseMenuResult> {
   const t0 = Date.now();
   console.log(`[parseMenu] start: ${images.length} image(s)`);
 
-  // Stage 1: parallel OCR.
-  const ocrResults = await Promise.all(
+  // Stage 1: parallel OCR, fault-tolerant per image.
+  const ocrSettled = await Promise.allSettled(
     images.map(async (img, i) => {
       const start = Date.now();
       const result = await ocrImage(client, img);
+      const preview = result.text.slice(0, 150).replace(/\s+/g, " ");
       console.log(
-        `[parseMenu] OCR ${i + 1}/${images.length} done in ${
+        `[parseMenu] OCR ${i + 1}/${images.length} ✓ ${
           Date.now() - start
-        }ms (${result.text.length} chars)`
+        }ms ${result.text.length}ch | ${preview}…`
       );
       return result;
     })
   );
-  const ocrTexts = ocrResults.map((r) => r.text);
-  console.log(`[parseMenu] stage 1 (OCR) total: ${Date.now() - t0}ms`);
+
+  const okOcr = ocrSettled
+    .map((r, i) => {
+      if (r.status === "fulfilled") return r.value;
+      console.error(
+        `[parseMenu] OCR ${i + 1}/${images.length} ✗ ${
+          r.reason instanceof Error ? r.reason.message : String(r.reason)
+        }`
+      );
+      return null;
+    })
+    .filter((r): r is NonNullable<typeof r> => r !== null);
+
+  console.log(
+    `[parseMenu] stage 1 done in ${Date.now() - t0}ms (${okOcr.length}/${
+      images.length
+    } images OCRd)`
+  );
+
+  if (okOcr.length === 0) {
+    throw new Error(
+      "Couldn't read any of your menu photos. Try clearer, well-lit shots."
+    );
+  }
 
   // Stage 2: text-only structuring.
   const t1 = Date.now();
-  const { menu, usage: structureUsage } = await structureMenu(client, ocrTexts);
-  console.log(`[parseMenu] stage 2 (structure) done in ${Date.now() - t1}ms`);
-  console.log(`[parseMenu] total: ${Date.now() - t0}ms`);
+  const ocrTexts = okOcr.map((r) => r.text);
+  const { menu: rawMenu, usage: structureUsage } = await structureMenu(
+    client,
+    ocrTexts
+  );
+  console.log(
+    `[parseMenu] stage 2 done in ${Date.now() - t1}ms (raw: ${
+      rawMenu?.items?.length ?? 0
+    } items, ${rawMenu?.categories?.length ?? 0} categories)`
+  );
 
+  const menu = repairMenu(rawMenu);
   validateMenu(menu);
 
-  // Aggregate usage across all calls so the caller sees the true cost.
-  const totalUsage = ocrResults.reduce(
+  console.log(
+    `[parseMenu] total: ${Date.now() - t0}ms (final: ${menu.items.length} items, ${menu.categories.length} categories)`
+  );
+
+  // Aggregate usage across all calls.
+  const totalUsage = okOcr.reduce(
     (acc, r) => ({
       input_tokens: acc.input_tokens + r.usage.input_tokens,
       output_tokens: acc.output_tokens + r.usage.output_tokens,
@@ -303,6 +335,76 @@ export async function parseMenu(images: MenuImage[]): Promise<ParseMenuResult> {
   return { menu, usage: totalUsage };
 }
 
+/**
+ * Auto-fix common model output issues so we don't blow up on near-misses:
+ *   - Dedup category ids and item ids (suffix -2, -3…).
+ *   - If item.category doesn't match any category, reassign to the first one
+ *     (better to show the item under the wrong section than drop it).
+ *   - If categories array is missing, synthesize a single "menu" category.
+ *   - Trim whitespace on string fields.
+ */
+function repairMenu(menu: ParsedMenu): ParsedMenu {
+  if (!menu || typeof menu !== "object") {
+    throw new Error("structuring returned non-object");
+  }
+
+  const repaired: ParsedMenu = {
+    ...menu,
+    restaurant: {
+      zh: menu.restaurant?.zh?.trim() || "餐廳",
+      en: menu.restaurant?.en?.trim() || "Restaurant",
+      address: menu.restaurant?.address?.trim() || undefined,
+      phone: menu.restaurant?.phone?.trim() || undefined,
+    },
+    currency: menu.currency?.trim() || "USD",
+    categories: Array.isArray(menu.categories) ? [...menu.categories] : [],
+    items: Array.isArray(menu.items) ? [...menu.items] : [],
+  };
+
+  // Synthesize a category if none exist but we have items.
+  if (repaired.categories.length === 0 && repaired.items.length > 0) {
+    repaired.categories.push({ id: "menu", zh: "菜單", en: "Menu" });
+  }
+
+  // Dedup category ids.
+  const seenCatIds = new Set<string>();
+  repaired.categories = repaired.categories.map((c) => {
+    let id = c.id?.trim() || `cat-${seenCatIds.size + 1}`;
+    if (seenCatIds.has(id)) {
+      let n = 2;
+      while (seenCatIds.has(`${id}-${n}`)) n++;
+      id = `${id}-${n}`;
+    }
+    seenCatIds.add(id);
+    return { ...c, id, zh: c.zh?.trim() || id, en: c.en?.trim() || id };
+  });
+
+  // Reassign orphan items + dedup item ids.
+  const validCatIds = new Set(repaired.categories.map((c) => c.id));
+  const fallbackCat = repaired.categories[0]?.id;
+  const seenItemIds = new Set<string>();
+  repaired.items = repaired.items.map((item, i) => {
+    let id = item.id?.trim() || `item-${i + 1}`;
+    if (seenItemIds.has(id)) {
+      let n = 2;
+      while (seenItemIds.has(`${id}-${n}`)) n++;
+      id = `${id}-${n}`;
+    }
+    seenItemIds.add(id);
+
+    const category = validCatIds.has(item.category) ? item.category : fallbackCat;
+    return {
+      ...item,
+      id,
+      category: category!,
+      zh: item.zh?.trim() || item.en?.trim() || id,
+      en: item.en?.trim() || item.zh?.trim() || id,
+    };
+  });
+
+  return repaired;
+}
+
 function validateMenu(menu: ParsedMenu): void {
   if (!menu || typeof menu !== "object") {
     throw new Error("menu must be an object");
@@ -314,33 +416,17 @@ function validateMenu(menu: ParsedMenu): void {
     throw new Error("menu must have at least one category");
   }
   if (!Array.isArray(menu.items) || menu.items.length === 0) {
-    throw new Error("menu must have at least one item");
+    throw new Error(
+      "Couldn't extract any dishes — the photos may be too blurry or empty."
+    );
   }
-
-  const catIds = new Set<string>();
-  for (const c of menu.categories) {
-    if (!c.id || !c.zh || !c.en) {
-      throw new Error(`category missing id/zh/en: ${JSON.stringify(c)}`);
-    }
-    if (catIds.has(c.id)) {
-      throw new Error(`duplicate category id: ${c.id}`);
-    }
-    catIds.add(c.id);
-  }
-
-  const itemIds = new Set<string>();
+  // ids and category references are already repaired upstream — just sanity check.
+  const catIds = new Set(menu.categories.map((c) => c.id));
   for (const item of menu.items) {
-    if (!item.id || !item.zh || !item.en || !item.category) {
-      throw new Error(`item missing required fields: ${JSON.stringify(item)}`);
-    }
     if (!catIds.has(item.category)) {
       throw new Error(
-        `item ${item.id} references unknown category ${item.category}`
+        `internal: item ${item.id} → unknown category ${item.category}`
       );
     }
-    if (itemIds.has(item.id)) {
-      throw new Error(`duplicate item id: ${item.id}`);
-    }
-    itemIds.add(item.id);
   }
 }
