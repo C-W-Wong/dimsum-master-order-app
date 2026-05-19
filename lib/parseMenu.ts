@@ -11,13 +11,33 @@ export type MenuImage = {
 };
 
 /**
- * System prompt is intentionally large and STATIC, so we can mark it
- * cache_control: ephemeral. Every menu-parse request reads it from cache
- * after the first one (5-min TTL refreshes on hit).
+ * Pipeline:
+ *   1. Each image → Haiku 4.5 vision OCR (parallel). Output is plain text.
+ *   2. Combined OCR text → Sonnet 4.6 text-only structuring via submit_menu tool.
+ *
+ * Two-stage is dramatically faster than a single Sonnet vision call because:
+ *   - Haiku is ~3× faster than Sonnet, and OCR (no reasoning) suits it.
+ *   - Sonnet on text-only is ~3× faster than Sonnet on vision.
+ *   - OCR for N photos runs in parallel; total wall-clock = max(OCR) + structure.
+ *
+ * Both system prompts use cache_control: ephemeral so the static prefixes hit
+ * Anthropic's 5-min prompt cache after the first call.
  */
-const SYSTEM_PROMPT = `You are a restaurant-menu OCR and extraction expert.
 
-You will receive one or more photos of a restaurant menu. Menus may be in any language (commonly Chinese + English, but also Japanese, Korean, Thai, etc.), printed or handwritten, with or without item codes (A1, B7, M12), and sometimes with category-level pricing ("Appetizers — all items $5.68"). Your job is to extract the FULL menu and call the submit_menu tool with structured data.
+const OCR_SYSTEM_PROMPT = `You are an OCR engine for restaurant menus. Your only job is to transcribe text from the photo verbatim.
+
+Rules:
+- Transcribe EVERY visible character: dish names (any language), prices, item codes (A1, B7, F12), category headers, notes, units (件, pcs, lb, oz, 隻, 半隻), currency symbols, taglines.
+- Preserve the visual order — top-to-bottom, then left-to-right for multi-column menus.
+- Keep Chinese characters as Chinese; Japanese as Japanese; etc. Do NOT translate.
+- For each row, keep name and price on the same line. Separate with two spaces.
+- Use a blank line between menu sections.
+- If a value is unclear, transcribe your best guess — don't omit the row.
+- Do NOT interpret, structure, JSON-ify, summarize, or comment. Output transcription only.`;
+
+const STRUCTURE_SYSTEM_PROMPT = `You are a restaurant-menu structuring expert.
+
+You will receive OCR-transcribed text from one or more menu photos. The OCR is faithful to the photo but may have garbled characters, broken layout, duplicate fragments, or items split across lines. Your job is to clean it up and call the submit_menu tool with structured data.
 
 # Output contract
 
@@ -28,7 +48,7 @@ Call submit_menu exactly once with the complete menu. Do not write any other tex
 - restaurant.zh — restaurant name in Traditional Chinese. Translate if menu only shows English.
 - restaurant.en — restaurant name in English. Translate if menu only shows Chinese.
 - currency — ISO 4217 code: "USD" (default for US menus), "HKD" (Hong Kong), "TWD" (Taiwan), "CNY", "CAD", "EUR", "JPY", "GBP", etc.
-- categories — every printed section of the menu, in the order they appear.
+- categories — every section visible in the OCR, in the order they appear.
 - items — every visible dish. Be exhaustive.
 
 # Field rules
@@ -43,17 +63,14 @@ Call submit_menu exactly once with the complete menu. Do not write any other tex
 - unitZh / unitEn: short qualifier shown on the menu — "4 件" / "4 pcs", "半隻" / "Half", "每磅" / "per lb". Omit when not present.
 - noteZh / noteEn: optional category caption — "全日供應" / "All day", "等候約 10 分鐘" / "≈ 10 min wait".
 
-# What to ignore
+# Handling OCR noise
 
-- Hours, phone numbers (unless restaurant.phone), legal disclaimers, photography credits, "prices subject to change", marketing taglines.
-- Item photographs themselves — only extract text/numbers.
+- If multiple photos are stitched together (separated by "--- PHOTO N ---"), merge them into one menu and do NOT duplicate items that appear on multiple photos.
+- If fragments look like a single dish broken across lines, merge them.
+- Skip OCR junk: hours, phone numbers (unless restaurant.phone), legal disclaimers, photography credits, "prices subject to change", marketing taglines.
 
 Be exhaustive, precise, and consistent. If a value is ambiguous, prefer leaving the optional field out over guessing.`;
 
-/**
- * One JSON Schema describing the entire parsed menu. Anthropic's tool_use
- * gives us reliable structured output without needing a Zod helper.
- */
 const SUBMIT_MENU_TOOL: Anthropic.Tool = {
   name: "submit_menu",
   description: "Submit the fully extracted restaurant menu.",
@@ -136,6 +153,91 @@ export type ParseMenuResult = {
   };
 };
 
+async function ocrImage(
+  client: Anthropic,
+  image: MenuImage
+): Promise<{ text: string; usage: Anthropic.Messages.Usage }> {
+  const response = await client.messages.create({
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 3000,
+    temperature: 0,
+    system: [
+      {
+        type: "text",
+        text: OCR_SYSTEM_PROMPT,
+        cache_control: { type: "ephemeral" },
+      },
+    ],
+    messages: [
+      {
+        role: "user",
+        content: [
+          {
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: image.mediaType,
+              data: image.data,
+            },
+          },
+          {
+            type: "text",
+            text: "Transcribe all visible text from this menu photo. Plain text only, preserving order.",
+          },
+        ],
+      },
+    ],
+  });
+
+  const text = response.content
+    .filter((b): b is Anthropic.TextBlock => b.type === "text")
+    .map((b) => b.text)
+    .join("\n")
+    .trim();
+
+  if (!text) {
+    throw new Error("OCR returned empty text — try a clearer photo");
+  }
+  return { text, usage: response.usage };
+}
+
+async function structureMenu(
+  client: Anthropic,
+  ocrTexts: string[]
+): Promise<{ menu: ParsedMenu; usage: Anthropic.Messages.Usage }> {
+  const userText =
+    ocrTexts.length === 1
+      ? `OCR'd menu text:\n\n${ocrTexts[0]}`
+      : `OCR'd text from ${ocrTexts.length} menu photos. Merge them into one menu.\n\n` +
+        ocrTexts.map((t, i) => `--- PHOTO ${i + 1} ---\n${t}`).join("\n\n");
+
+  const response = await client.messages.create({
+    model: "claude-sonnet-4-6",
+    max_tokens: 4000,
+    temperature: 0,
+    system: [
+      {
+        type: "text",
+        text: STRUCTURE_SYSTEM_PROMPT,
+        cache_control: { type: "ephemeral" },
+      },
+    ],
+    tools: [SUBMIT_MENU_TOOL],
+    tool_choice: { type: "tool", name: "submit_menu" },
+    messages: [{ role: "user", content: userText }],
+  });
+
+  const toolUse = response.content.find(
+    (block) => block.type === "tool_use" && block.name === "submit_menu"
+  );
+  if (!toolUse || toolUse.type !== "tool_use") {
+    throw new Error(
+      "Claude did not call submit_menu — OCR text may be unreadable"
+    );
+  }
+  return { menu: toolUse.input as ParsedMenu, usage: response.usage };
+}
+
 export async function parseMenu(images: MenuImage[]): Promise<ParseMenuResult> {
   if (images.length === 0) {
     throw new Error("at least one image is required");
@@ -148,66 +250,37 @@ export async function parseMenu(images: MenuImage[]): Promise<ParseMenuResult> {
 
   const client = new Anthropic({ apiKey });
 
-  const response = await client.messages.create({
-    // Haiku 4.5 for vision OCR — ~2-3× faster than Sonnet, fits Vercel's
-    // 60s function cap. Switch back to claude-sonnet-4-6 if OCR quality
-    // suffers on complex/handwritten menus.
-    model: "claude-haiku-4-5-20251001",
-    max_tokens: 4000,
-    system: [
-      {
-        type: "text",
-        text: SYSTEM_PROMPT,
-        // Cache the static prompt — every parse hits the same prefix.
-        cache_control: { type: "ephemeral" },
-      },
-    ],
-    tools: [SUBMIT_MENU_TOOL],
-    tool_choice: { type: "tool", name: "submit_menu" },
-    messages: [
-      {
-        role: "user",
-        content: [
-          ...images.map((img) => ({
-            type: "image" as const,
-            source: {
-              type: "base64" as const,
-              media_type: img.mediaType,
-              data: img.data,
-            },
-          })),
-          {
-            type: "text" as const,
-            text:
-              images.length === 1
-                ? "Extract the full menu from this photo."
-                : `Extract the full menu. These ${images.length} photos are different parts of the same menu — merge them.`,
-          },
-        ],
-      },
-    ],
-  });
-
-  const toolUse = response.content.find(
-    (block) => block.type === "tool_use" && block.name === "submit_menu"
+  // Stage 1: parallel OCR.
+  const ocrResults = await Promise.all(
+    images.map((img) => ocrImage(client, img))
   );
-  if (!toolUse || toolUse.type !== "tool_use") {
-    throw new Error("Claude did not call submit_menu — try clearer photos");
-  }
+  const ocrTexts = ocrResults.map((r) => r.text);
 
-  const menu = toolUse.input as ParsedMenu;
+  // Stage 2: text-only structuring.
+  const { menu, usage: structureUsage } = await structureMenu(client, ocrTexts);
   validateMenu(menu);
 
-  return {
-    menu,
-    usage: {
-      input_tokens: response.usage.input_tokens,
-      output_tokens: response.usage.output_tokens,
-      cache_read_input_tokens: response.usage.cache_read_input_tokens ?? 0,
+  // Aggregate usage across all calls so the caller sees the true cost.
+  const totalUsage = ocrResults.reduce(
+    (acc, r) => ({
+      input_tokens: acc.input_tokens + r.usage.input_tokens,
+      output_tokens: acc.output_tokens + r.usage.output_tokens,
+      cache_read_input_tokens:
+        acc.cache_read_input_tokens + (r.usage.cache_read_input_tokens ?? 0),
       cache_creation_input_tokens:
-        response.usage.cache_creation_input_tokens ?? 0,
-    },
-  };
+        acc.cache_creation_input_tokens +
+        (r.usage.cache_creation_input_tokens ?? 0),
+    }),
+    {
+      input_tokens: structureUsage.input_tokens,
+      output_tokens: structureUsage.output_tokens,
+      cache_read_input_tokens: structureUsage.cache_read_input_tokens ?? 0,
+      cache_creation_input_tokens:
+        structureUsage.cache_creation_input_tokens ?? 0,
+    }
+  );
+
+  return { menu, usage: totalUsage };
 }
 
 function validateMenu(menu: ParsedMenu): void {
